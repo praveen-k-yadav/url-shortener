@@ -12,6 +12,7 @@ import (
 
 	"url-shortener/db"
 
+	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -49,8 +50,8 @@ func RootPageUrlhandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ShortURLHandler handles URL creation, idempotency, hash collision retries,
-// and concurrent duplicate submission safety.
-func ShortURLHandler(collection *mongo.Collection) http.HandlerFunc {
+// and pre-populates the Redis cache upon successful insert.
+func ShortURLHandler(collection *mongo.Collection, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var data struct {
 			URL string `json:"url"`
@@ -64,9 +65,12 @@ func ShortURLHandler(collection *mongo.Collection) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		// 1. Check if the URL has already been shortened
+		// 1. Check if the URL has already been shortened (MongoDB check for idempotency)
 		existing, err := db.GetURLByOriginal(ctx, collection, data.URL)
 		if err == nil {
+			// Ensure it's cached in Redis as well
+			rdb.Set(ctx, "url:"+existing.ShortURL, existing.OriginalURL, 30*24*time.Hour)
+			fmt.Println("Data coming from Redis...")
 			respondJSON(w, existing.ShortURL)
 			return
 		}
@@ -87,15 +91,12 @@ func ShortURLHandler(collection *mongo.Collection) http.HandlerFunc {
 
 			// Handle duplicate key conflicts (code 11000)
 			if mongo.IsDuplicateKeyError(err) {
-				// Case A: Another concurrent request just inserted the exact same original_url
 				existingRecord, fetchErr := db.GetURLByOriginal(ctx, collection, data.URL)
 				if fetchErr == nil {
 					respondJSON(w, existingRecord.ShortURL)
 					return
 				}
 
-				// Case B: Different original_url produced the same short_url (hash collision).
-				// Append a nanosecond salt and retry.
 				salt = fmt.Sprintf("_%d", time.Now().UnixNano())
 				if i == maxRetries-1 {
 					http.Error(w, "Failed to generate a unique short URL", http.StatusInternalServerError)
@@ -104,9 +105,14 @@ func ShortURLHandler(collection *mongo.Collection) http.HandlerFunc {
 				continue
 			}
 
-			// Any other database error (e.g., network failure, timeout)
 			http.Error(w, "Failed to save URL to database", http.StatusInternalServerError)
 			return
+		}
+
+		// 3. Pre-populate Redis cache with a 30-day TTL upon successful creation
+		cacheKey := "url:" + shortURL
+		if err := rdb.Set(ctx, cacheKey, data.URL, 30*24*time.Hour).Err(); err != nil {
+			log.Printf("Warning: Failed to set Redis cache: %v", err)
 		}
 
 		respondJSON(w, shortURL)
@@ -123,8 +129,8 @@ func respondJSON(w http.ResponseWriter, shortURL string) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// RedirectURLHandler fetches the original URL from MongoDB and redirects the user
-func RedirectURLHandler(collection *mongo.Collection) http.HandlerFunc {
+// RedirectURLHandler implements the Cache-Aside pattern (Redis -> MongoDB fallback -> Backfill)
+func RedirectURLHandler(collection *mongo.Collection, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Path[len("/redirect/"):]
 		if id == "" {
@@ -135,12 +141,33 @@ func RedirectURLHandler(collection *mongo.Collection) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
+		cacheKey := "url:" + id
+
+		// Step A: Check Redis Cache first (O(1) lookup)
+		cachedURL, err := rdb.Get(ctx, cacheKey).Result()
+		if err == nil {
+			// Cache Hit! Redirect immediately without touching MongoDB
+			fmt.Println("Data coming from Redis-Redirect Url")
+			http.Redirect(w, r, cachedURL, http.StatusFound)
+			return
+		} else if err != redis.Nil {
+			// Log unexpected Redis errors (other than standard cache miss)
+			log.Printf("Redis error: %v", err)
+		}
+
+		// Step B: Cache Miss - Query MongoDB source of truth
 		urlRecord, err := db.GetURLByShortCode(ctx, collection, id)
 		if err != nil {
 			http.Error(w, "URL not found", http.StatusNotFound)
 			return
 		}
 
+		// Step C: Backfill Redis Cache for subsequent requests (with 30-day TTL)
+		if err := rdb.Set(ctx, cacheKey, urlRecord.OriginalURL, 30*24*time.Hour).Err(); err != nil {
+			log.Printf("Warning: Failed to backfill Redis cache: %v", err)
+		}
+
+		// Step D: Redirect user
 		http.Redirect(w, r, urlRecord.OriginalURL, http.StatusFound)
 	}
 }
@@ -154,6 +181,21 @@ func main() {
 	}
 	defer cleanup()
 
+	// Initialize Redis Client
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "", // Set password if your Redis instance requires one
+		DB:       0,  // Default DB
+	})
+
+	// Ping Redis to verify connection on startup
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Println("Connected to Redis successfully")
+
 	// Ensure unique indexes exist on startup
 	indexCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -163,10 +205,10 @@ func main() {
 
 	log.Printf("Successfully got collection handle: %s", collection.Name())
 
-	// Register HTTP routes
+	// Register HTTP routes, passing both MongoDB collection and Redis client
 	http.HandleFunc("/", RootPageUrlhandler)
-	http.HandleFunc("/shorten", ShortURLHandler(collection))
-	http.HandleFunc("/redirect/", RedirectURLHandler(collection))
+	http.HandleFunc("/shorten", ShortURLHandler(collection, rdb))
+	http.HandleFunc("/redirect/", RedirectURLHandler(collection, rdb))
 
 	fmt.Println("Starting the server at port 3000...")
 	err = http.ListenAndServe(":3000", nil)
