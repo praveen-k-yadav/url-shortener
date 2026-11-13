@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"url-shortener/db"
@@ -23,9 +24,14 @@ func main() {
 	}
 	defer cleanup()
 
-	// Initialize Redis Client
+	// Inside your main function:
+	redisAddr := os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379" // fallback for local development
+	}
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: "", // Set password if your Redis instance requires one
 		DB:       0,  // Default DB
 	})

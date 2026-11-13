@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -17,7 +18,10 @@ func ConnectDB() (*mongo.Collection, func(), error) {
 	defer cancel()
 
 	// Replace with your MongoDB URI or Atlas connection string
-	uri := "mongodb://localhost:27017"
+	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		uri = "mongodb://localhost:27017" // fallback for local runs
+	}
 
 	// Configure connection pool & timeouts
 	clientOptions := options.Client().
