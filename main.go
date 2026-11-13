@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"url-shortener/db"
+	"url-shortener/middleware"
 
 	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -207,7 +208,9 @@ func main() {
 
 	// Register HTTP routes, passing both MongoDB collection and Redis client
 	http.HandleFunc("/", RootPageUrlhandler)
-	http.HandleFunc("/shorten", ShortURLHandler(collection, rdb))
+
+	limiter := middleware.RateLimiter(rdb, 10, 1*time.Minute)
+	http.HandleFunc("/shorten", limiter(ShortURLHandler(collection, rdb)))
 	http.HandleFunc("/redirect/", RedirectURLHandler(collection, rdb))
 
 	fmt.Println("Starting the server at port 3000...")
