@@ -93,7 +93,7 @@ url-shortener/
 **Response:**
 ```json
 {
-  "shortCode": "abc1234"
+    "short_url": "bdpkeFYm"
 }
 ```
 
