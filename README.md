@@ -59,8 +59,9 @@ url-shortener/
    go mod download
    ```
 
-3. Run the application:
+3. Run the redis container and then the application:
    ```bash
+   docker run --name my-redis -p 6379:6379 -d redis:alpine
    go run main.go
    ```
 
@@ -71,9 +72,9 @@ url-shortener/
    docker build -t url-shortener .
    ```
 
-2. Run the container:
+2. Run the redis container created above then the container:
    ```bash
-   docker run -p 8080:8080 --env-file .env url-shortener
+   docker run --name url-shortener-app -p 3000:3000 --link my-redis:redis -e REDIS_URL="redis:6379" -e MONGO_URI="mongodb://host.docker.internal:27017" -d url-shortener
    ```
 
 ## API Usage
@@ -99,9 +100,8 @@ url-shortener/
 
 ### 2. Redirect to Original URL
 
-* **Endpoint:** `GET /{shortCode}`
+* **Endpoint:** `GET /redirect/{shortCode}`
 * **Description:** Automatically redirects the browser or HTTP client to the original long URL destination.
 
 ```bash
-curl -I http://localhost:8080/abc1234
-```
+curl -I http://localhost:3000/redirect/g2Edu7bJ
